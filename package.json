@@ -18,8 +18,7 @@
     "build": "node scripts/build.mjs",
     "watch": "node scripts/build.mjs --watch",
     "link-dsh": "node scripts/link-dsh.mjs",
-    "typecheck": "tsc --noEmit",
-    "prepare": "node scripts/build.mjs"
+    "typecheck": "tsc --noEmit"
   },
   "dsh": {
     "bundle": {
