@@ -71,23 +71,12 @@ const CSS = /* css */`
   flex-shrink: 0;
   backdrop-filter: blur(8px);
   background: color-mix(in srgb, var(--dsw-alias-bg-base, #fff) 85%, transparent);
-  -webkit-app-region: drag;
 }
-.dsw-topbar * { -webkit-app-region: no-drag; }
 .dsw-topbar-title {
   font-size: 16px; font-weight: 600; margin-right: auto;
   letter-spacing: .02em;
 }
-.dsw-topbar-close {
-  background: none; border: none; cursor: pointer; font-size: 18px;
-  color: var(--dsw-alias-label-secondary, #666);
-  width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
-  border-radius: 8px; transition: all .15s;
-}
-.dsw-topbar-close:hover {
-  background: var(--dsw-alias-interactive-bg-hover, #f0f0f0);
-  transform: scale(1.05);
-}
+/* topbar close button removed — Electron title bar intercepts clicks */
 
 /* ═══ Layout ══════════════════════════════ */
 .dsw-body { display: flex; flex: 1; overflow: hidden; }
@@ -2164,7 +2153,6 @@ const Workbench: FC<{ onClose: () => void }> = ({ onClose }) => {
     h(ConfirmDialog, null),
     h('div', { className: 'dsw-topbar' },
       h('span', { className: 'dsw-topbar-title' }, '📱 自媒体工作台'),
-      h('button', { className: 'dsw-topbar-close', onClick: onClose, title: '关闭 (Esc)' }, '✕'),
     ),
     h('div', { className: 'dsw-body' },
       h('nav', { className: 'dsw-nav' },
@@ -2178,6 +2166,16 @@ const Workbench: FC<{ onClose: () => void }> = ({ onClose }) => {
             h('span', { className: 'dsw-nav-icon' }, item.icon),
             h('span', null, item.label),
           ),
+        ),
+        h('div', { style: { flex: 1 } }),
+        h('button', {
+          className: 'dsw-nav-item',
+          style: { color: 'var(--dsw-alias-label-tertiary, #999)', marginTop: 8 },
+          onClick: onClose,
+          title: '关闭工作台 (Esc)',
+        },
+          h('span', { className: 'dsw-nav-icon' }, '✕'),
+          h('span', null, '关闭'),
         ),
       ),
       h('main', { className: 'dsw-content', key: pageKey },
@@ -2198,10 +2196,14 @@ const SidebarButton: FC<{ wide?: boolean }> = ({ wide }) => {
     return () => { if (_closeOverlay === close) _closeOverlay = null }
   }, [close])
 
-  return h('div', null,
+  return h('div', { style: { display: 'contents' } },
     h('button', {
       className: 'dsw-sidebar-btn',
-      onClick: () => setOpen(true),
+      onClick: (e: { stopPropagation: () => void; preventDefault: () => void }) => {
+        e.stopPropagation()
+        e.preventDefault()
+        setOpen(true)
+      },
       title: '自媒体工作台',
     },
       h('span', { className: 'dsw-sidebar-btn-icon' }, '📱'),
