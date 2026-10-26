@@ -67,6 +67,13 @@ export interface PlatformVersion {
   updatedAt: string
 }
 
+export interface PublishResult {
+  platform: Platform
+  url?: string
+  publishedAt: string
+  opencliOutput?: string
+}
+
 export interface Draft {
   id: string
   topicId?: string
@@ -76,6 +83,7 @@ export interface Draft {
   status: DraftStatus
   versions: PlatformVersion[]
   checks: CheckReport[]
+  publishResults: PublishResult[]
   scheduledAt?: string
   createdAt: string
   updatedAt: string
@@ -183,6 +191,15 @@ export interface HotList {
   items: HotItem[]
 }
 
+export interface TrendingItem {
+  platform: string
+  rank: number
+  title: string
+  heat: number
+  url?: string
+  label?: string
+}
+
 export interface DashboardSummary {
   materials: number
   topicsNew: number
@@ -191,12 +208,19 @@ export interface DashboardSummary {
   outliers: Array<{ account: string; video: VideoInfo }>
   upcoming: Array<{ id: string; title: string; platform: Platform; scheduledAt: string }>
   tikhubReady: boolean
+  opencliReady: boolean
+  wenyanReady: boolean
+  wechatConfigured: boolean
   llmReady: boolean
 }
 
 export interface SettingsView {
   profile: CreatorProfile
   tikhubConfigured: boolean
+  opencliReady: boolean
+  wenyanReady: boolean
+  wechatConfigured: boolean
+  dataDir: string
   model: { provider: string; model: string } | null
 }
 

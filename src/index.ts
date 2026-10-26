@@ -3,16 +3,19 @@ import '@deepseek-ai/dsh-agent-default-model'
 import '@deepseek-ai/dsh-host-webserver'
 import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions } from '@deepseek-ai/dsh-llm'
+import type { JsonValue } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Config } from './config.ts'
 import type { Config as ConfigType } from './config.ts'
 import type {
   AccountScan, ApiError, CheckKind, CheckReport, CreatorProfile, DashboardSummary,
-  Draft, DraftStatus, HotItem, HotList, Material, Platform, SettingsView, Topic,
-  TopicStatus, VideoInfo, WatchedAccount,
+  Draft, DraftStatus, HotItem, HotList, Material, Platform, PublishResult, SettingsView,
+  Topic, TopicStatus, TrendingItem, VideoInfo, WatchedAccount,
 } from './shared/types.ts'
 import { CHECK_KINDS, PLATFORMS } from './shared/types.ts'
+import { OpenCLIBridge } from './opencli.ts'
+import { WenyanBridge } from './wenyan.ts'
 import { WorkbenchStore, expandHome, newId, nowIso } from './store.ts'
 import { TikHubClient, TikHubError } from './tikhub.ts'
 
@@ -157,6 +160,15 @@ export function apply(ctx: Context, config: ConfigType) {
 
   const llmEnv: LlmEnv = { llm: ctx.llm, agentDefaultModel: ctx.agentDefaultModel, config }
 
+  const opencli = new OpenCLIBridge({ timeoutMs: 120_000, throttleMinMs: 20_000, throttleMaxMs: 35_000 })
+  const wenyan = new WenyanBridge({ timeoutMs: 120_000 })
+
+  /** Check if TikHub API key is configured. */
+  const isTikhubReady = async (): Promise<boolean> => {
+    const secrets = await store.secrets()
+    return !!(secrets.tikhubKey || process.env[config.tikhubKeyEnv])
+  }
+
   // ═══════════════════════════════════════════════════════════════════
   // TOOLS — registered so the Agent (LLM) can call them
   // ═══════════════════════════════════════════════════════════════════
@@ -198,9 +210,45 @@ export function apply(ctx: Context, config: ConfigType) {
         }]
       },
     },
-    timeoutMs: config.tikhubTimeoutMs + 5000,
+    timeoutMs: 120_000,
     async execute(args, exec) {
-      return await tikhub.videoByShareUrl(args.share_text, exec.signal) as never
+      const useTikhub = await isTikhubReady()
+      if (useTikhub) {
+        return await tikhub.videoByShareUrl(args.share_text, exec.signal) as never
+      }
+
+      const awemeIdMatch = args.share_text.match(/video\/(\d+)/)
+      if (!awemeIdMatch) {
+        throw new Error('未配置 TikHub API Key，OpenCLI 需要视频 aweme_id（无法从短链接提取）。请提供完整视频链接（含 /video/ID）。')
+      }
+      const awemeId = awemeIdMatch[1]!
+      const stats = await opencli.douyinStats(awemeId)
+      const statsMap = new Map(stats.map(s => [s.metric, s.value]))
+      const video: VideoInfo = {
+        id: awemeId,
+        platform: 'douyin',
+        url: args.share_text,
+        desc: String(statsMap.get('title') ?? ''),
+        createTime: nowIso(),
+        durationSec: 0,
+        author: {
+          id: '',
+          secUid: '',
+          nickname: String(statsMap.get('author') ?? '未知'),
+          followers: 0,
+        },
+        stats: {
+          plays: Number(statsMap.get('play_count') ?? statsMap.get('播放') ?? 0),
+          likes: Number(statsMap.get('digg_count') ?? statsMap.get('点赞') ?? 0),
+          comments: Number(statsMap.get('comment_count') ?? statsMap.get('评论') ?? 0),
+          shares: Number(statsMap.get('share_count') ?? statsMap.get('分享') ?? 0),
+          collects: Number(statsMap.get('collect_count') ?? statsMap.get('收藏') ?? 0),
+        },
+        engagementRate: 0,
+      }
+      const totalInteractions = video.stats.likes + video.stats.comments + video.stats.shares + video.stats.collects
+      video.engagementRate = video.stats.plays > 0 ? totalInteractions / video.stats.plays : 0
+      return video as never
     },
   }))
 
@@ -223,9 +271,23 @@ export function apply(ctx: Context, config: ConfigType) {
         return [{ type: 'text', text: `🔥 **抖音热搜** (${hot.fetchedAt})\n\n${lines.join('\n')}` }]
       },
     },
-    timeoutMs: config.tikhubTimeoutMs + 5000,
+    timeoutMs: 120_000,
     async execute(_args, exec) {
-      const items = await tikhub.hotSearch(exec.signal)
+      const useTikhub = await isTikhubReady()
+
+      let items: HotItem[]
+      if (useTikhub) {
+        items = await tikhub.hotSearch(exec.signal)
+      } else {
+        const cliItems = await opencli.douyinHot(30)
+        items = cliItems.map((h, i) => ({
+          rank: i + 1,
+          word: h.name,
+          hot: h.view_count,
+          label: '热点',
+        }))
+      }
+
       const hotList: HotList = { platform: 'douyin', fetchedAt: nowIso(), items }
       await store.mutate(data => { data.hot = hotList })
       return hotList as never
@@ -264,17 +326,55 @@ export function apply(ctx: Context, config: ConfigType) {
         }]
       },
     },
-    timeoutMs: config.tikhubTimeoutMs * 2 + 10000,
+    timeoutMs: 180_000,
     async execute(args, exec) {
+      const useTikhub = await isTikhubReady()
       let secUid = args.identifier
-      if (secUid.startsWith('http')) {
-        secUid = await tikhub.secUidFromUrl(secUid, exec.signal)
+
+      let videos: VideoInfo[]
+
+      if (useTikhub) {
+        if (secUid.startsWith('http')) {
+          secUid = await tikhub.secUidFromUrl(secUid, exec.signal)
+        }
+        videos = await tikhub.userPosts(secUid, config.scanPostCount, exec.signal)
+      } else {
+        if (secUid.startsWith('http')) {
+          const match = secUid.match(/user\/([A-Za-z0-9_-]+)/)
+          if (match?.[1]) {
+            secUid = match[1]
+          } else {
+            throw new Error('请提供用户 sec_uid 或包含 /user/SEC_UID 的完整主页链接。')
+          }
+        }
+        const cliVideos = await opencli.douyinUserVideos(secUid, config.scanPostCount)
+        videos = cliVideos.map(cv => ({
+          id: cv.aweme_id,
+          platform: 'douyin' as const,
+          url: `https://www.douyin.com/video/${cv.aweme_id}`,
+          desc: cv.title,
+          createTime: nowIso(),
+          durationSec: cv.duration,
+          author: {
+            id: '',
+            secUid,
+            nickname: args.nickname ?? secUid.slice(0, 8),
+            followers: 0,
+          },
+          stats: {
+            plays: 0,
+            likes: cv.digg_count,
+            comments: 0,
+            shares: 0,
+            collects: 0,
+          },
+          engagementRate: 0,
+        }))
       }
 
-      const videos = await tikhub.userPosts(secUid, config.scanPostCount, exec.signal)
-      const plays = videos.map(v => v.stats.plays)
+      const plays = videos.map(v => v.stats.plays || v.stats.likes)
       const med = median(plays)
-      const outlierIds = videos.filter(v => v.stats.plays > med * config.outlierFactor).map(v => v.id)
+      const outlierIds = videos.filter(v => (v.stats.plays || v.stats.likes) > med * config.outlierFactor).map(v => v.id)
 
       const accountId = await store.mutate(data => {
         let account = data.accounts.find(a => a.secUid === secUid)
@@ -451,6 +551,7 @@ export function apply(ctx: Context, config: ConfigType) {
           status: 'writing',
           versions: [],
           checks: [],
+          publishResults: [],
           createdAt: nowIso(),
           updatedAt: nowIso(),
         }
@@ -603,6 +704,467 @@ export function apply(ctx: Context, config: ConfigType) {
     },
   }))
 
+  // ── social_publish ──────────────────────────────────────────────────
+
+  ctx.tools.register(defineTool({
+    name: 'social_publish',
+    description: '通过 OpenCLI 自动发布草稿到目标平台。需要用户已安装 opencli 并登录对应平台。当前支持小红书和 X/Twitter。',
+    parameters: {
+      draft_id: { type: 'string', required: true, description: '草稿 ID' },
+      platform: { type: 'string', description: '目标平台（默认使用草稿原始平台）。支持 xiaohongshu, twitter' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: true, properties: {
+          platform: { type: 'string', required: true },
+          publishedAt: { type: 'string', required: true },
+        },
+      },
+      render(_args, value) {
+        const lines = [`✅ 已发布到 ${value.platform}`]
+        if ('url' in value && typeof value.url === 'string') lines.push(`🔗 ${value.url}`)
+        lines.push(`📅 ${value.publishedAt}`)
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    timeoutMs: 180_000,
+    async execute(args) {
+      const data = await store.read()
+      const draft = data.drafts.find(d => d.id === args.draft_id)
+      if (!draft) throw new Error(`草稿不存在：${args.draft_id}`)
+      if (draft.status === 'published') throw new Error('草稿已发布')
+
+      const targetPlatform = (args.platform as Platform | undefined) ?? draft.platform
+      const version = draft.versions.find(v => v.platform === targetPlatform)
+      const title = version?.title ?? draft.title
+      const body = version?.body ?? draft.body
+      const hashtags = version?.hashtags ?? []
+
+      const result = await opencli.publish(targetPlatform, { title, content: body, hashtags })
+
+      const publishResult: PublishResult = {
+        platform: targetPlatform,
+        url: result.url,
+        publishedAt: nowIso(),
+        opencliOutput: result.output,
+      }
+
+      await store.mutate(d => {
+        const target = d.drafts.find(x => x.id === draft.id)
+        if (target) {
+          if (!target.publishResults) target.publishResults = []
+          target.publishResults.push(publishResult)
+          target.status = 'published'
+          target.updatedAt = nowIso()
+        }
+      })
+
+      return publishResult as never
+    },
+  }))
+
+  // ── social_trending ────────────────────────────────────────────────
+
+  ctx.tools.register(defineTool({
+    name: 'social_trending',
+    description: '通过 OpenCLI 获取多平台热搜/热门趋势（B站、知乎等），发现内容灵感。需要用户已安装 opencli。',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'array',
+        items: {
+          type: 'object', additionalProperties: true, properties: {
+            platform: { type: 'string', required: true },
+            title: { type: 'string', required: true },
+            heat: { type: 'number', required: true },
+          },
+        },
+      },
+      render(_args, value) {
+        const items = value as unknown as TrendingItem[]
+        const byPlatform: Record<string, TrendingItem[]> = {}
+        for (const item of items) {
+          const key = item.platform
+          if (!byPlatform[key]) byPlatform[key] = []
+          byPlatform[key]!.push(item)
+        }
+        const lines: string[] = [`🔥 获取到 ${items.length} 条热搜趋势`]
+        for (const [platform, pItems] of Object.entries(byPlatform)) {
+          lines.push(`\n**${platform}:**`)
+          for (const item of pItems.slice(0, 5)) {
+            lines.push(`  ${item.rank}. ${item.title} (热度 ${item.heat.toLocaleString()})`)
+          }
+        }
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    timeoutMs: 60_000,
+    async execute() {
+      const items = await opencli.fetchAllTrending()
+      return items as never
+    },
+  }))
+
+  // ── social_xhs_search ─────────────────────────────────────────────
+
+  ctx.tools.register(defineTool({
+    name: 'social_xhs_search',
+    description: '通过 OpenCLI 在小红书上搜索内容，了解竞品和市场动态。需要用户已安装 opencli 并登录小红书。',
+    parameters: {
+      query: { type: 'string', required: true, description: '搜索关键词' },
+      limit: { type: 'number', description: '返回条数（默认 10）' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: true, properties: {
+          items: { type: 'array', required: true, items: { type: 'object', additionalProperties: true } },
+        },
+      },
+      render(_args, value) {
+        const items = (value.items ?? []) as Array<Record<string, JsonValue>>
+        const lines = [`📕 小红书搜索结果（${items.length} 条）：\n`]
+        for (const item of items.slice(0, 10)) {
+          lines.push(`• **${String(item.title ?? '')}** — ❤️ ${item.likes ?? 0} 📑 ${item.collects ?? 0}`)
+        }
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    timeoutMs: 60_000,
+    async execute(args) {
+      const result = await opencli.xhsSearch(args.query, typeof args.limit === 'number' ? args.limit : 10)
+      return result as never
+    },
+  }))
+
+  // ── social_wechat_render ────────────────────────────────────────────
+
+  ctx.tools.register(defineTool({
+    name: 'social_wechat_render',
+    description: '使用文颜(wenyan)将 Markdown 内容渲染为微信公众号适配的 HTML 排版。支持多种主题。需安装 wenyan CLI。',
+    parameters: {
+      markdown: { type: 'string', required: true, description: 'Markdown 内容（含 frontmatter：title, cover, author）' },
+      theme: { type: 'string', description: '排版主题名称（可选）' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: true, properties: {
+          html: { type: 'string', required: true },
+        },
+      },
+      render(_args, value) {
+        const htmlLen = typeof value.html === 'string' ? value.html.length : 0
+        return [{ type: 'text', text: `✅ 已渲染公众号 HTML（${htmlLen} 字符）` }]
+      },
+    },
+    timeoutMs: 60_000,
+    async execute(args) {
+      const result = await wenyan.render(args.markdown, {
+        theme: typeof args.theme === 'string' ? args.theme : undefined,
+      })
+      return { html: result.html } as never
+    },
+  }))
+
+  // ── social_wechat_publish ──────────────────────────────────────────
+
+  ctx.tools.register(defineTool({
+    name: 'social_wechat_publish',
+    description: '通过文颜(wenyan)将 Markdown 草稿发布到微信公众号草稿箱。需安装 wenyan CLI 并配置 WECHAT_APP_ID 和 WECHAT_APP_SECRET。',
+    parameters: {
+      draft_id: { type: 'string', required: true, description: '草稿 ID' },
+      theme: { type: 'string', description: '排版主题（可选）' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: true, properties: {
+          success: { type: 'boolean', required: true },
+          platform: { type: 'string', required: true },
+        },
+      },
+      render(_args, value) {
+        if (value.success) {
+          return [{ type: 'text', text: '✅ 已推送到微信公众号草稿箱！' }]
+        }
+        const msg = 'message' in value ? String(value.message) : '发布失败'
+        return [{ type: 'text', text: `❌ ${msg}` }]
+      },
+    },
+    timeoutMs: 180_000,
+    async execute(args) {
+      const data = await store.read()
+      const draft = data.drafts.find(d => d.id === args.draft_id)
+      if (!draft) throw new Error(`草稿不存在：${args.draft_id}`)
+
+      const version = draft.versions.find(v => v.platform === 'wechat')
+      const title = version?.title ?? draft.title
+      const body = version?.body ?? draft.body
+
+      const markdown = [
+        '---',
+        `title: ${title}`,
+        `author: ${data.profile.name || ''}`,
+        '---',
+        '',
+        body,
+      ].join('\n')
+
+      const result = await wenyan.publish(markdown, {
+        theme: typeof args.theme === 'string' ? args.theme : undefined,
+      })
+
+      if (result.success) {
+        const publishResult: PublishResult = {
+          platform: 'wechat',
+          publishedAt: nowIso(),
+          opencliOutput: result.output,
+        }
+        await store.mutate(d => {
+          const target = d.drafts.find(x => x.id === draft.id)
+          if (target) {
+            if (!target.publishResults) target.publishResults = []
+            target.publishResults.push(publishResult)
+            if (target.status !== 'published') target.status = 'published'
+            target.updatedAt = nowIso()
+          }
+        })
+      }
+
+      return { success: result.success, platform: 'wechat', message: result.message, mediaId: result.mediaId } as never
+    },
+  }))
+
+  // ── social_title_gen ────────────────────────────────────────────────
+
+  ctx.tools.register(defineTool({
+    name: 'social_title_gen',
+    description: '为草稿生成 10 个爆款标题候选。借鉴小红书/抖音/公众号的爆款标题公式（数字法、悬念法、对比法、蹭热点等），生成适合目标平台风格的标题。',
+    parameters: {
+      draft_id: { type: 'string', required: true, description: '草稿 ID' },
+      platform: { type: 'string', description: '覆盖目标平台（默认用草稿本身的平台）' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: true, properties: {
+          titles: { type: 'array', items: { type: 'string' }, required: true },
+        },
+      },
+      render(_args, value) {
+        const titles = Array.isArray(value.titles) ? value.titles as string[] : []
+        if (titles.length === 0) return [{ type: 'text', text: '未能生成标题' }]
+        return [{ type: 'text', text: `🔥 ${titles.length} 个爆款标题候选：\n\n${titles.map((t, i) => `${i + 1}. ${t}`).join('\n')}` }]
+      },
+    },
+    timeoutMs: config.llmTimeoutMs + 10000,
+    async execute(args) {
+      const data = await store.read()
+      const draft = data.drafts.find(d => d.id === args.draft_id)
+      if (!draft) throw new Error(`草稿不存在：${args.draft_id}`)
+      const platform = typeof args.platform === 'string' ? args.platform : draft.platform
+      const system = `你是资深自媒体标题优化专家。你需要为用户的内容生成 10 个爆款标题候选。
+
+目标平台：${platform}
+
+爆款标题公式：
+1. 数字法：「3 个方法让你...」「90% 的人不知道的...」
+2. 悬念法：「我终于发现了...的秘密」「千万别...否则...」
+3. 对比法：「月薪 3000 和月薪 30000 的区别」
+4. 情绪法：「看完我沉默了」「太离谱了！」
+5. 身份认同：「打工人必看」「宝妈收藏」
+6. 时效法：「2024 最新」「刚刚发现」
+7. 利他法：「教你一招」「建议收藏」
+
+以 JSON 数组输出 10 个标题，只输出 JSON 数组。`
+      const raw = await llmGenerate(llmEnv, system, `标题：${draft.title}\n\n正文摘要：${draft.body.slice(0, 500)}`, undefined)
+      const match = raw.match(/\[[\s\S]*\]/)
+      const titles = match ? JSON.parse(match[0]) as string[] : []
+      return { titles } as never
+    },
+  }))
+
+  // ── social_weekly_plan ─────────────────────────────────────────────
+
+  ctx.tools.register(defineTool({
+    name: 'social_weekly_plan',
+    description: '根据创作者画像和素材库，生成 7 天内容发布计划。包含每天的主题、标题建议、目标平台和发布时间建议。',
+    parameters: {
+      focus: { type: 'string', description: '本周重点方向（可选）' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: true, properties: {
+          plan: { type: 'array', items: { type: 'object', additionalProperties: true }, required: true },
+        },
+      },
+      render(_args, value) {
+        const plan = Array.isArray(value.plan) ? value.plan as Array<{ day: string; theme: string; title: string; platform: string; time: string }> : []
+        if (plan.length === 0) return [{ type: 'text', text: '未能生成计划' }]
+        return [{ type: 'text', text: `📆 7 天内容计划：\n\n${plan.map(p => `**${p.day}** | ${p.platform} | ${p.time}\n📌 ${p.theme}\n💡 ${p.title}`).join('\n\n')}` }]
+      },
+    },
+    timeoutMs: config.llmTimeoutMs * 2 + 10000,
+    async execute(args) {
+      const data = await store.read()
+      const profile = data.profile
+      const focus = typeof args.focus === 'string' ? args.focus : ''
+      const recentTopics = data.topics.slice(-10).map(t => t.title).join('、')
+      const recentMaterials = data.materials.slice(-10).map(m => m.title).join('、')
+      const system = `你是资深自媒体内容策略师。根据创作者画像和已有素材，制定 7 天内容发布计划。
+
+创作者画像：
+- 名称：${profile.name}
+- 赛道：${profile.niche}
+- 受众：${profile.audience}
+- 定位：${profile.offer}
+${focus ? `- 本周重点：${focus}` : ''}
+
+已有选题参考：${recentTopics || '无'}
+已有素材参考：${recentMaterials || '无'}
+
+要求：
+1. 每天 1 条内容，覆盖不同平台（小红书、抖音、公众号、B站、视频号、X 各至少 1 条）
+2. 内容主题有节奏感（知识/故事/互动/干货/热点 穿插）
+3. 建议最佳发布时间
+4. 标题要有网感和吸引力
+
+以 JSON 数组输出，每项包含 { day, theme, title, platform, time, type }，只输出 JSON。`
+      const raw = await llmGenerate(llmEnv, system, `请生成本周内容计划`, undefined)
+      const match = raw.match(/\[[\s\S]*\]/)
+      const plan = match ? JSON.parse(match[0]) as Array<{ day: string; theme: string; title: string; platform: string; time: string; type: string }> : []
+      return { plan } as never
+    },
+  }))
+
+  // ── social_content_score ───────────────────────────────────────────
+
+  ctx.tools.register(defineTool({
+    name: 'social_content_score',
+    description: '对草稿进行综合评分（0-100），给出各维度评分和改进建议。维度：标题吸引力、内容价值、平台适配、情绪共鸣、结构清晰度、发布时机。',
+    parameters: {
+      draft_id: { type: 'string', required: true, description: '草稿 ID' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: true, properties: {
+          total: { type: 'number', required: true },
+          grade: { type: 'string', required: true },
+        },
+      },
+      render(_args, value) {
+        const total = typeof value.total === 'number' ? value.total : 0
+        const grade = typeof value.grade === 'string' ? value.grade : '?'
+        const dims = Array.isArray(value.dimensions) ? value.dimensions as Array<{ name: string; score: number; feedback: string }> : []
+        const lines = [`📊 内容评分：${total}/100 (${grade})`, '']
+        for (const d of dims) {
+          const bar = '█'.repeat(Math.round(d.score / 10)) + '░'.repeat(10 - Math.round(d.score / 10))
+          lines.push(`${d.name} ${bar} ${d.score}/100`)
+          lines.push(`  💡 ${d.feedback}`)
+        }
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    timeoutMs: config.llmTimeoutMs + 10000,
+    async execute(args) {
+      const data = await store.read()
+      const draft = data.drafts.find(d => d.id === args.draft_id)
+      if (!draft) throw new Error(`草稿不存在：${args.draft_id}`)
+      const system = `你是内容质量评估专家。对以下自媒体内容进行多维度评分（每项 0-100）：
+
+维度：
+1. title_appeal - 标题吸引力：是否有好奇心缺口、情绪点、数字
+2. content_value - 内容价值：是否有干货/故事/共鸣/新知
+3. platform_fit - 平台适配：是否符合目标平台风格和规范
+4. emotional - 情绪共鸣：是否能引发点赞/收藏/评论
+5. structure - 结构清晰度：开头是否抓人、中间是否有节奏、结尾是否有行动号召
+6. ai_natural - 自然度：是否像真人写的、有没有 AI 味
+
+以 JSON 输出：
+{
+  "total": 总分(加权平均),
+  "grade": "S/A/B/C/D",
+  "dimensions": [
+    { "name": "标题吸引力", "score": 分数, "feedback": "一句话建议" },
+    ...
+  ],
+  "summary": "整体点评"
+}
+只输出 JSON。`
+      const raw = await llmGenerate(llmEnv, system, `平台：${draft.platform}\n标题：${draft.title}\n\n${draft.body}`, undefined)
+      const match = raw.match(/\{[\s\S]*\}/)
+      if (!match) throw new Error('评分解析失败')
+      return JSON.parse(match[0]) as never
+    },
+  }))
+
+  // ── social_adapt_all ───────────────────────────────────────────────
+
+  ctx.tools.register(defineTool({
+    name: 'social_adapt_all',
+    description: '一键将草稿改写为所有主流平台版本（小红书、抖音、公众号、B站、视频号、X/Twitter）。每个平台版本根据平台特点调整风格、字数、格式。',
+    parameters: {
+      draft_id: { type: 'string', required: true, description: '草稿 ID' },
+      platforms: { type: 'string', description: '逗号分隔的目标平台列表（默认全部）' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: true, properties: {
+          versions: { type: 'number', required: true },
+        },
+      },
+      render(_args, value) {
+        const count = typeof value.versions === 'number' ? value.versions : 0
+        return [{ type: 'text', text: `✅ 已生成 ${count} 个平台版本！可在工作台草稿详情查看。` }]
+      },
+    },
+    timeoutMs: config.llmTimeoutMs * 6 + 30000,
+    async execute(args, exec) {
+      const data = await store.read()
+      const draft = data.drafts.find(d => d.id === args.draft_id)
+      if (!draft) throw new Error(`草稿不存在：${args.draft_id}`)
+
+      const targetPlatforms = typeof args.platforms === 'string'
+        ? args.platforms.split(',').map(s => s.trim()).filter(Boolean) as Platform[]
+        : PLATFORMS.filter(p => p !== draft.platform)
+
+      let count = 0
+      for (const platform of targetPlatforms) {
+        if (exec.signal?.aborted) break
+        const existing = draft.versions.find(v => v.platform === platform)
+        if (existing) continue
+
+        const raw = await llmGenerate(
+          llmEnv,
+          `${DRAFT_WRITE_SYSTEM}\n\n创作者画像：\n赛道：${data.profile.niche}\n受众：${data.profile.audience}\n文风：${data.profile.voiceGuide || '自然真诚'}`,
+          `将以下内容改写为 ${platform} 平台版本：\n\n标题：${draft.title}\n原文：${draft.body}\n\n目标平台：${platform}`,
+          exec.signal,
+        )
+
+        try {
+          const match = raw.match(/\{[\s\S]*\}/)
+          if (match) {
+            const parsed = JSON.parse(match[0]) as { title: string; body: string; coverText?: string; hashtags?: string[] }
+            await store.mutate(d => {
+              const target = d.drafts.find(x => x.id === draft.id)
+              if (target) {
+                target.versions.push({
+                  platform,
+                  title: parsed.title,
+                  body: parsed.body,
+                  coverText: parsed.coverText ?? '',
+                  hashtags: parsed.hashtags ?? [],
+                  updatedAt: nowIso(),
+                })
+                target.updatedAt = nowIso()
+              }
+            })
+            count++
+          }
+        } catch { /* skip unparseable */ }
+      }
+
+      return { versions: count, platforms: targetPlatforms } as never
+    },
+  }))
+
   // ═══════════════════════════════════════════════════════════════════
   // HTTP API — consumed by the browser workbench
   // ═══════════════════════════════════════════════════════════════════
@@ -644,6 +1206,9 @@ export function apply(ctx: Context, config: ConfigType) {
               .slice(0, 5)
               .map(d => ({ id: d.id, title: d.title, platform: d.platform, scheduledAt: d.scheduledAt! })),
             tikhubReady: await tikhub.ready(),
+            opencliReady: await opencli.isAvailable(),
+            wenyanReady: await wenyan.isAvailable(),
+            wechatConfigured: wenyan.isWechatConfigured(),
             llmReady: true,
           }
           return jsonRes(res, 200, summary)
@@ -752,6 +1317,10 @@ export function apply(ctx: Context, config: ConfigType) {
           const view: SettingsView = {
             profile: data.profile,
             tikhubConfigured: !!(secrets.tikhubKey || process.env[config.tikhubKeyEnv]),
+            opencliReady: await opencli.isAvailable(),
+            wenyanReady: await wenyan.isAvailable(),
+            wechatConfigured: wenyan.isWechatConfigured(),
+            dataDir: store.dataDir,
             model: config.provider && config.model
               ? { provider: config.provider, model: config.model }
               : { provider: defaultModel.provider, model: defaultModel.model },
@@ -769,6 +1338,145 @@ export function apply(ctx: Context, config: ConfigType) {
           const body = await jsonBody<{ key: string }>(req)
           await store.saveSecrets({ tikhubKey: body.key || undefined })
           return jsonRes(res, 200, { ok: true })
+        }
+
+        // ── Publish API ────────────────────────────────────────────
+        if (method === 'POST' && path.startsWith('/api/drafts/') && path.endsWith('/publish')) {
+          const draftId = path.split('/')[3]
+          const body = await jsonBody<{ platform?: Platform }>(req)
+          const data = await store.read()
+          const draft = data.drafts.find(d => d.id === draftId)
+          if (!draft) return errRes(res, 404, '草稿不存在')
+
+          const targetPlatform = body.platform ?? draft.platform
+          const version = draft.versions.find(v => v.platform === targetPlatform)
+          const title = version?.title ?? draft.title
+          const content = version?.body ?? draft.body
+          const hashtags = version?.hashtags ?? []
+
+          const result = await opencli.publish(targetPlatform, { title, content, hashtags })
+          const publishResult: PublishResult = {
+            platform: targetPlatform,
+            url: result.url,
+            publishedAt: nowIso(),
+            opencliOutput: result.output,
+          }
+
+          await store.mutate(d => {
+            const target = d.drafts.find(x => x.id === draftId)
+            if (target) {
+              if (!target.publishResults) target.publishResults = []
+              target.publishResults.push(publishResult)
+              target.status = 'published'
+              target.updatedAt = nowIso()
+            }
+          })
+          return jsonRes(res, 200, publishResult)
+        }
+
+        // ── Preview API ─────────────────────────────────────────────
+        if (method === 'GET' && path.startsWith('/api/drafts/') && path.endsWith('/preview')) {
+          const draftId = path.split('/')[3]
+          const platform = url.searchParams.get('platform') ?? 'wechat'
+          const data = await store.read()
+          const draft = data.drafts.find(d => d.id === draftId)
+          if (!draft) return errRes(res, 404, '草稿不存在')
+
+          const version = draft.versions.find(v => v.platform === platform)
+          const title = version?.title ?? draft.title
+          const body = version?.body ?? draft.body
+          const hashtags = version?.hashtags ?? []
+
+          if (platform === 'wechat') {
+            const wenyanReady = await wenyan.isAvailable()
+            if (wenyanReady) {
+              const markdown = `---\ntitle: ${title}\nauthor: ${data.profile.name || ''}\n---\n\n${body}`
+              const result = await wenyan.render(markdown)
+              return jsonRes(res, 200, { platform, title, body, hashtags, html: result.html })
+            }
+            return jsonRes(res, 200, { platform, title, body, hashtags, html: null })
+          }
+
+          return jsonRes(res, 200, { platform, title, body, hashtags, html: null })
+        }
+
+        // ── WeChat publish API ──────────────────────────────────────
+        if (method === 'POST' && path.startsWith('/api/drafts/') && path.endsWith('/wechat-publish')) {
+          const draftId = path.split('/')[3]
+          const data = await store.read()
+          const draft = data.drafts.find(d => d.id === draftId)
+          if (!draft) return errRes(res, 404, '草稿不存在')
+
+          const version = draft.versions.find(v => v.platform === 'wechat')
+          const title = version?.title ?? draft.title
+          const body = version?.body ?? draft.body
+
+          const markdown = [
+            '---',
+            `title: ${title}`,
+            `author: ${data.profile.name || ''}`,
+            '---',
+            '',
+            body,
+          ].join('\n')
+
+          const result = await wenyan.publish(markdown)
+
+          if (result.success) {
+            const publishResult: PublishResult = {
+              platform: 'wechat',
+              publishedAt: nowIso(),
+              opencliOutput: result.output,
+            }
+            await store.mutate(d => {
+              const target = d.drafts.find(x => x.id === draftId)
+              if (target) {
+                if (!target.publishResults) target.publishResults = []
+                target.publishResults.push(publishResult)
+                if (target.status !== 'published') target.status = 'published'
+                target.updatedAt = nowIso()
+              }
+            })
+          }
+
+          return jsonRes(res, 200, { success: result.success, message: result.message, mediaId: result.mediaId })
+        }
+
+        // ── OpenCLI status API ─────────────────────────────────────
+        if (method === 'GET' && path === '/api/opencli/status') {
+          const ready = await opencli.isAvailable()
+          return jsonRes(res, 200, { ready })
+        }
+
+        // ── Trending API ───────────────────────────────────────────
+        if (method === 'GET' && path === '/api/trending') {
+          const items = await opencli.fetchAllTrending()
+          return jsonRes(res, 200, items)
+        }
+
+        // ── Workspace directory API ────────────────────────────────
+        if (method === 'GET' && path === '/api/workspace') {
+          return jsonRes(res, 200, { dataDir: store.dataDir })
+        }
+
+        if (method === 'POST' && path === '/api/workspace/pick') {
+          const picker = ctx.get('directoryPicker')
+          if (!picker) return errRes(res, 501, '目录选择器不可用，请确认 DSH Desktop 版本支持')
+          const cap = picker.capability()
+          if (cap.kind !== 'native') return errRes(res, 501, '当前环境不支持原生目录选择')
+          const ac = new AbortController()
+          req.on('close', () => ac.abort())
+          const picked = await cap.pick(ac.signal)
+          if (!picked) return jsonRes(res, 200, { picked: null, dataDir: store.dataDir })
+          await store.switchDir(picked)
+          return jsonRes(res, 200, { picked, dataDir: store.dataDir })
+        }
+
+        if (method === 'POST' && path === '/api/workspace/set') {
+          const body = await jsonBody<{ dataDir: string }>(req)
+          if (!body.dataDir) return errRes(res, 400, '缺少 dataDir')
+          await store.switchDir(body.dataDir)
+          return jsonRes(res, 200, { dataDir: store.dataDir })
         }
 
         errRes(res, 404, 'Not found')

@@ -1,5 +1,3 @@
-# dsh-social plugin registration for the DSH Cordis host.
-# The host entry registers tools + HTTP API; the client entry (auto-discovered
-# from package.json "dsh.client") renders the browser workbench.
-dsh-social:
-  $path: dsh-social
+- insert:
+    - id: dsh-social
+      name: dsh-social

@@ -66,7 +66,7 @@ async function writeJsonAtomic(path: string, value: unknown, mode: number): Prom
  * concurrent HTTP requests and tool calls never interleave read-modify-write.
  */
 export class WorkbenchStore {
-  readonly #dir: string
+  #dir: string
   #data: WorkbenchData | undefined
   #secrets: Secrets | undefined
   #queue: Promise<unknown> = Promise.resolve()
@@ -75,11 +75,31 @@ export class WorkbenchStore {
     this.#dir = expandHome(dataDir)
   }
 
+  /** Current data directory path. */
+  get dataDir(): string { return this.#dir }
+
+  /**
+   * Switch to a different data directory at runtime. Flushes the in-memory
+   * cache so the next read loads from the new path. Existing queued mutations
+   * targeting the old directory finish before the swap takes effect.
+   */
+  async switchDir(newDir: string): Promise<void> {
+    const resolved = expandHome(newDir)
+    await mkdir(resolved, { recursive: true, mode: 0o700 })
+    await this.#queue
+    this.#dir = resolved
+    this.#data = undefined
+    this.#secrets = undefined
+  }
+
   async #load(): Promise<WorkbenchData> {
     if (this.#data === undefined) {
       await mkdir(this.#dir, { recursive: true, mode: 0o700 })
       const stored = await readJson<Partial<WorkbenchData>>(join(this.#dir, 'workbench.json'))
       this.#data = { ...emptyData(), ...stored }
+      for (const draft of this.#data.drafts) {
+        if (!draft.publishResults) draft.publishResults = []
+      }
     }
     return this.#data
   }
