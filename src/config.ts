@@ -22,7 +22,7 @@ export interface Config {
 
 export const Config: z<Config> = z.object({
   dataDir: z.string().default('~/.dsh/social').description('工作台数据目录'),
-  routePrefix: z.string().default('/social').description('工作台 HTTP 接口前缀'),
+  routePrefix: z.string().default('/dsh-social').description('工作台 HTTP 接口前缀'),
   provider: z.string().description('写作用模型的 provider；留空则使用 Agent 默认模型'),
   model: z.string().description('写作用模型 id；需与 provider 同时填写'),
   maxOutputTokens: z.natural().default(8192).description('单次写作最大输出 token'),
